@@ -1,24 +1,50 @@
 
 import os
+
+# ============================================================
+# TENSORFLOW CPU MEMORY / THREAD CONTROL
+# ============================================================
+
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["TF_NUM_INTRAOP_THREADS"] = "1"
+os.environ["TF_NUM_INTEROP_THREADS"] = "1"
+
 import io
+import gc
 import base64
+
 import numpy as np
 import tensorflow as tf
 import cv2
 
 from PIL import Image
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
 from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import FileResponse
+
+# ============================================================
+# TENSORFLOW THREAD LIMIT
+# ============================================================
+
+try:
+    tf.config.threading.set_intra_op_parallelism_threads(1)
+    tf.config.threading.set_inter_op_parallelism_threads(1)
+except RuntimeError:
+    pass
 
 # ============================================================
 # PATHS
 # ============================================================
 
-FRONTEND_DIR = os.path.join(os.path.dirname(__file__), "Website_Frontend")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+FRONTEND_DIR = os.path.join(
+    BASE_DIR,
+    "Website_Frontend"
+)
 
 MODEL_PATH = os.path.join(
-    os.path.dirname(__file__),
+    BASE_DIR,
     "IDRiD_EfficientNetB0_DR.keras"
 )
 
@@ -50,7 +76,9 @@ print("Model parameters:", model.count_params())
 # GRAD-CAM MODEL
 # ============================================================
 
-efficientnet = model.get_layer("efficientnetb0")
+efficientnet = model.get_layer(
+    "efficientnetb0"
+)
 
 target_layer = efficientnet.get_layer(
     "top_activation"
@@ -79,12 +107,11 @@ print("Target layer:", target_layer.name)
 print("Target shape:", target_layer.output.shape)
 
 # ============================================================
-# GRAD-CAM FUNCTION
+# GRAD-CAM
 # ============================================================
 
 def generate_gradcam(image_array):
 
-    # Convert to tensor
     image_tensor = tf.convert_to_tensor(
         image_array,
         dtype=tf.float32
@@ -94,10 +121,6 @@ def generate_gradcam(image_array):
         image_tensor,
         axis=0
     )
-
-    # --------------------------------------------------------
-    # Forward pass + gradients
-    # --------------------------------------------------------
 
     with tf.GradientTape() as tape:
 
@@ -113,18 +136,10 @@ def generate_gradcam(image_array):
         conv_output
     )
 
-    # --------------------------------------------------------
-    # Global-average-pool gradients
-    # --------------------------------------------------------
-
     weights = tf.reduce_mean(
         gradients,
         axis=(1, 2)
     )
-
-    # --------------------------------------------------------
-    # Weighted feature maps
-    # --------------------------------------------------------
 
     cam = tf.reduce_sum(
         weights[:, tf.newaxis, tf.newaxis, :]
@@ -132,28 +147,32 @@ def generate_gradcam(image_array):
         axis=-1
     )
 
-    # --------------------------------------------------------
-    # ReLU
-    # --------------------------------------------------------
-
     cam = tf.maximum(
         cam,
         0
     )
-
-    # --------------------------------------------------------
-    # Normalize
-    # --------------------------------------------------------
 
     cam = cam / (
         tf.reduce_max(cam)
         + 1e-8
     )
 
-    return (
-        cam[0].numpy(),
-        float(prediction[0][0])
+    probability = float(
+        prediction[0, 0].numpy()
     )
+
+    # Convert only the final CAM to NumPy.
+    cam_np = cam[0].numpy()
+
+    # Explicitly release TensorFlow temporaries.
+    del image_tensor
+    del conv_output
+    del prediction
+    del gradients
+    del weights
+    del cam
+
+    return cam_np, probability
 
 # ============================================================
 # IMAGE → BASE64 PNG
@@ -165,12 +184,17 @@ def image_to_base64(image):
 
     image.save(
         buffer,
-        format="PNG"
+        format="PNG",
+        optimize=True
     )
 
-    return base64.b64encode(
+    encoded = base64.b64encode(
         buffer.getvalue()
     ).decode("utf-8")
+
+    buffer.close()
+
+    return encoded
 
 # ============================================================
 # HOME
@@ -178,26 +202,50 @@ def image_to_base64(image):
 
 @app.get("/")
 def home():
+
     return FileResponse(
-        os.path.join(FRONTEND_DIR, "index.html")
+        os.path.join(
+            FRONTEND_DIR,
+            "index.html"
+        )
+    )
+
+# ============================================================
+# HEALTH CHECK
+# ============================================================
+
+@app.head("/")
+def health_check():
+    return None
+
+# ============================================================
+# STATIC FILES
+# ============================================================
+
+@app.get("/style.css")
+def style():
+
+    return FileResponse(
+        os.path.join(
+            FRONTEND_DIR,
+            "style.css"
+        )
+    )
+
+
+@app.get("/script.js")
+def script():
+
+    return FileResponse(
+        os.path.join(
+            FRONTEND_DIR,
+            "script.js"
+        )
     )
 
 # ============================================================
 # PREDICTION + GRAD-CAM
 # ============================================================
-
-
-@app.get("/style.css")
-def style():
-    return FileResponse(
-        os.path.join(FRONTEND_DIR, "style.css")
-    )
-
-@app.get("/script.js")
-def script():
-    return FileResponse(
-        os.path.join(FRONTEND_DIR, "script.js")
-    )
 
 @app.post("/predict")
 async def predict(
@@ -208,8 +256,13 @@ async def predict(
     # Validate image
     # --------------------------------------------------------
 
-    if not file.content_type.startswith("image/"):
+    if not file.content_type:
+        raise HTTPException(
+            status_code=400,
+            detail="Please upload a valid fundus image."
+        )
 
+    if not file.content_type.startswith("image/"):
         raise HTTPException(
             status_code=400,
             detail="Please upload a valid fundus image."
@@ -220,6 +273,13 @@ async def predict(
     # --------------------------------------------------------
 
     image_bytes = await file.read()
+
+    # Basic upload size protection.
+    if len(image_bytes) > 15 * 1024 * 1024:
+        raise HTTPException(
+            status_code=413,
+            detail="Image file is too large. Please upload an image below 15 MB."
+        )
 
     try:
 
@@ -234,6 +294,9 @@ async def predict(
             detail="Unable to read the uploaded image."
         )
 
+    # Release uploaded bytes as soon as PIL has decoded them.
+    del image_bytes
+
     # --------------------------------------------------------
     # Resize for EfficientNet-B0
     # --------------------------------------------------------
@@ -243,49 +306,26 @@ async def predict(
         Image.Resampling.LANCZOS
     )
 
-    # IMPORTANT:
-    # Model was trained using 0–255 input
-    image_array = np.array(
-        image_224
-    ).astype(np.float32)
-
-    image_input = np.expand_dims(
-        image_array,
-        axis=0
+    # Model was trained using 0–255 input.
+    image_array = np.asarray(
+        image_224,
+        dtype=np.float32
     )
 
     # --------------------------------------------------------
-    # Prediction
+    # ONE FORWARD PASS:
+    # Prediction + Grad-CAM
     # --------------------------------------------------------
 
-    prediction = model.predict(
-        image_input,
-        verbose=0
-    )
-
-    probability = float(
-        prediction[0][0]
-    )
-
-    # --------------------------------------------------------
-    # Classification
-    # --------------------------------------------------------
-
-    if probability >= 0.5:
-
-        result = "Referable DR"
-
-    else:
-
-        result = "Non-referable DR"
-
-    # --------------------------------------------------------
-    # Grad-CAM
-    # --------------------------------------------------------
-
-    cam, gradcam_probability = generate_gradcam(
+    cam, probability = generate_gradcam(
         image_array
     )
+
+    # Classification
+    if probability >= 0.5:
+        result = "Referable DR"
+    else:
+        result = "Non-referable DR"
 
     # --------------------------------------------------------
     # Resize CAM to original image size
@@ -297,12 +337,15 @@ async def predict(
 
     cam_resized = cv2.resize(
         cam,
-        (original_width, original_height)
+        (original_width, original_height),
+        interpolation=cv2.INTER_LINEAR
     )
 
-    cam_uint8 = np.uint8(
-        cam_resized * 255
-    )
+    cam_uint8 = np.clip(
+        cam_resized * 255,
+        0,
+        255
+    ).astype(np.uint8)
 
     # --------------------------------------------------------
     # Create heatmap
@@ -322,7 +365,7 @@ async def predict(
     # Create overlay
     # --------------------------------------------------------
 
-    original_np = np.array(
+    original_np = np.asarray(
         original_image
     )
 
@@ -335,7 +378,7 @@ async def predict(
     )
 
     # --------------------------------------------------------
-    # Convert images to PIL
+    # Convert to PIL
     # --------------------------------------------------------
 
     heatmap_image = Image.fromarray(
@@ -347,7 +390,7 @@ async def predict(
     )
 
     # --------------------------------------------------------
-    # Base64 images for website
+    # Base64
     # --------------------------------------------------------
 
     original_base64 = image_to_base64(
@@ -363,10 +406,10 @@ async def predict(
     )
 
     # --------------------------------------------------------
-    # Return result
+    # Prepare response
     # --------------------------------------------------------
 
-    return {
+    response = {
 
         "filename": file.filename,
 
@@ -379,7 +422,7 @@ async def predict(
 
         "prediction": result,
 
-        "gradcam_probability": gradcam_probability,
+        "gradcam_probability": probability,
 
         "gradcam_layer": "top_activation",
 
@@ -389,3 +432,23 @@ async def predict(
 
         "gradcam_overlay": overlay_base64
     }
+
+    # --------------------------------------------------------
+    # Release request-specific arrays/images
+    # --------------------------------------------------------
+
+    del image_224
+    del image_array
+    del cam
+    del cam_resized
+    del cam_uint8
+    del heatmap
+    del original_np
+    del overlay
+    del heatmap_image
+    del overlay_image
+    del original_image
+
+    gc.collect()
+
+    return response
